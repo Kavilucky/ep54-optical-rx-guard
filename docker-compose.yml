@@ -1,0 +1,71 @@
+# Проверка рецептов на очковые линзы и автовозврат клиентов: n8n + PostgreSQL + Ollama (qwen2.5-vl) + Cloudflare Tunnel (эпизод 54, пример, не проверен на живом сервере).
+# Теги образов закрепите после первого успешного запуска (docker compose images) и сверьте с документацией проектов.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pg_data:/var/lib/postgresql/data          # постоянный том: без него история рецептов и карты клиентов исчезнут
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest                     # локальная мультимодальная модель читает бланк на вашем сервере; фото в облачные нейросети не уходит
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama                   # после запуска: docker compose exec ollama ollama pull <модель из OLLAMA_VL_MODEL>
+    # порт наружу не публикуется: n8n обращается к http://ollama:11434 по внутренней сети
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}   # задать один раз и не менять
+      N8N_HOST: ${HOST}
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://${HOST}/                # по этому адресу Telegram доставляет сообщения боту
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"         # сценарий читает $env.ADMIN_CHAT_ID, RX_CHAT_IDS, RX_DOCTOR_IDS, OLLAMA_VL_MODEL
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID}
+      RX_CHAT_IDS: ${RX_CHAT_IDS}
+      RX_DOCTOR_IDS: ${RX_DOCTOR_IDS}
+      OLLAMA_VL_MODEL: ${OLLAMA_VL_MODEL}
+      GENERIC_TIMEZONE: ${TZ}
+      TZ: ${TZ}
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}                # токен из Cloudflare Zero Trust; маршрут: ваш домен -> http://n8n:5678
+    depends_on:
+      - n8n
+    # Через туннель Telegram доставляет сообщения боту без открытых портов на сервере.
+    # Важно: фото бланка проходит через серверы Telegram и трафик через Cloudflare. Локально остаются распознавание, сценарий и база.
+    # Для редактора n8n закройте доступ правилами Cloudflare Access. Условия бесплатного Cloudflare Tunnel проверяйте на сайте Cloudflare.
+
+volumes:
+  pg_data:
+  n8n_data:
+  ollama_data:

@@ -1,0 +1,1044 @@
+{
+  "name": "Проверка рецептов на очковые линзы и автовозврат клиентов (эп. 54)",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "name": "Сообщение боту",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "adaba72d-61cc-505a-a63c-9bff189312b6",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "notes": "Закрытый бот: сообщения от мастеров (фото бланка с подписью «карта 1234») и нажатия кнопок. Адрес доставки берётся из WEBHOOK_URL через Cloudflare Tunnel."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Разбор входящего обновления Telegram: фото бланка от мастера, нажатие кнопки врача, запись клиента. Чужие чаты и пользователи отбрасываются.\nconst u = $json;\nconst list = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);\nconst masters = list($env.RX_CHAT_IDS);      // чаты мастеров, которым разрешено слать бланки\nconst doctors = list($env.RX_DOCTOR_IDS);    // Telegram id врачей, которым разрешено подтверждать\nconst out = { kind: 'reject' };\nconst cb = u.callback_query;\nconst msg = u.message;\nif (cb && cb.data) {\n  const from = String(cb.from && cb.from.id || '');\n  const d = String(cb.data);\n  let m = /^(ok|no):(\\d{1,12})$/.exec(d);\n  if (m && doctors.includes(from)) return { json: { kind: 'decision', decision: m[1], rx_id: m[2], doctor: from, chat: String(cb.message && cb.message.chat && cb.message.chat.id || '') } };\n  m = /^book:(\\d{3,10})$/.exec(d);\n  if (m) return { json: { kind: 'book', card: m[1], chat: String(cb.message && cb.message.chat && cb.message.chat.id || '') } };\n  return { json: out };\n}\nif (msg && Array.isArray(msg.photo) && msg.photo.length) {\n  const chat = String(msg.chat && msg.chat.id || '');\n  if (!masters.includes(chat)) return { json: out };\n  const big = msg.photo[msg.photo.length - 1];\n  const m = /(?:карта|card)\\s*[:№#]?\\s*(\\d{3,10})/i.exec(String(msg.caption || ''));\n  if (!m) return { json: { kind: 'nocard', chat } };\n  return { json: { kind: 'photo', chat, message_id: msg.message_id, file_id: big.file_id, card: m[1] } };\n}\nreturn { json: out };\n"
+      },
+      "name": "Разобрать сообщение",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "id": "3806aca3-b4e3-511b-b36c-857a309ab239",
+      "notes": "Чужие чаты и пользователи отбрасываются (RX_CHAT_IDS, RX_DOCTOR_IDS). Подтверждать рецепт может только врач из списка."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.kind }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "photo"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Фото бланка?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        0
+      ],
+      "id": "7d806232-029d-5762-9e11-6b8358ae0719"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "get",
+        "fileId": "={{ $json.file_id }}",
+        "download": true
+      },
+      "name": "Скачать фото",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        -120
+      ],
+      "id": "67fa24ed-9794-501d-ba91-b641cc13f0bf",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "notes": "Фото попадает в память n8n и дальше только в локальную Ollama; на диск не сохраняется. Проверьте в своей версии n8n, что бинарные данные не пишутся в базу."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Запрос к локальной мультимодальной модели: фото бланка в base64 уходит только в Ollama на вашем сервере.\nconst buf = await this.helpers.getBinaryDataBuffer('data');\nif (!buf || !buf.length) throw new Error('пустое фото');\nconst prompt = [\n  'Это фото бумажного бланка рецепта на очки.',\n  'Верни ТОЛЬКО JSON такого вида: {\"rows\":[\"OD\",\"OS\"],\"columns\":[\"SPH\",\"CYL\",\"AXIS\"],\"od\":{\"sph\":0,\"cyl\":0,\"axis\":0},\"os\":{\"sph\":0,\"cyl\":0,\"axis\":0},\"add\":0,\"pd\":0}.',\n  'rows и columns: подписи строк и столбцов таблицы в том порядке, в каком они напечатаны на бланке. OD это правый глаз, OS это левый глаз.',\n  'Значения бери из ячеек строки OD для od и строки OS для os. Числа с точкой, знак + или - обязателен там, где он написан. Если значение не читается, верни null.',\n  'Имена, даты, телефоны и любой другой текст не читай и не возвращай.',\n].join(' ');\nconst body = { model: $env.OLLAMA_VL_MODEL, stream: false, format: 'json', options: { temperature: 0 }, messages: [{ role: 'user', content: prompt, images: [buf.toString('base64')] }] };\nreturn { json: { body: JSON.stringify(body) } };\n"
+      },
+      "name": "Запрос к qwen2.5-vl",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        -120
+      ],
+      "id": "3a163a5b-89d8-5eb6-8aaf-8a4d0d6bceb8",
+      "notes": "Why Code: фото переводится в base64 для Ollama. Модель просят вернуть только числа и подписи таблицы, имена и даты не читать."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ollama:11434/api/chat",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.body }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "name": "Ollama читает бланк",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        -120
+      ],
+      "id": "25659006-dac7-534a-8960-3886729b4676",
+      "notes": "Локальная мультимодальная модель на вашем сервере. Точность на ваших бланках не проверялась; скорость на CPU может быть десятки секунд.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Проверка ответа модели: привязка к якорным меткам (подписи строк и столбцов), диапазоны, шаг 0,25. Любая неясность даёт ручной ввод, а не «чисто».\nconst src = $('Разобрать сообщение').item.json;\nconst errors = [];\nlet r = null;\nconst raw = $json.message && $json.message.content;\ntry { r = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { errors.push('ответ модели не JSON'); }\nif (!r || typeof r !== 'object') { r = {}; if (!errors.length) errors.push('пустой ответ модели'); }\nconst up = (a) => (Array.isArray(a) ? a.map((x) => String(x).trim().toUpperCase()) : []);\nconst rows = up(r.rows), cols = up(r.columns);\nif (!(rows.includes('OD') && rows.includes('OS') && rows.indexOf('OD') < rows.indexOf('OS'))) errors.push('таблица не опознана по якорным меткам: нет строк OD и OS');\nif (!['SPH', 'CYL', 'AXIS'].every((c) => cols.includes(c))) errors.push('таблица не опознана по якорным меткам: нет столбцов SPH, CYL, AXIS');\nconst num = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(String(v).replace(',', '.').replace('−', '-').replace(/\\s/g, ''));\n  return Number.isFinite(n) ? n : NaN;\n};\nconst step = (v) => Math.abs(v * 4 - Math.round(v * 4)) < 1e-9;\nfunction eye(name, o) {\n  o = o || {};\n  const e = { sph: num(o.sph), cyl: num(o.cyl), axis: num(o.axis) };\n  if (e.sph === null || Number.isNaN(e.sph)) errors.push(name + ': sph не прочитан');\n  else { if (e.sph < -20 || e.sph > 20) errors.push(name + ': sph вне диапазона'); else if (!step(e.sph)) errors.push(name + ': sph не кратен 0,25'); }\n  if (e.cyl === null || Number.isNaN(e.cyl)) errors.push(name + ': cyl не прочитан');\n  else { if (e.cyl < -8 || e.cyl > 8) errors.push(name + ': cyl вне диапазона'); else if (!step(e.cyl)) errors.push(name + ': cyl не кратен 0,25'); }\n  if (e.cyl !== null && !Number.isNaN(e.cyl) && e.cyl !== 0) {\n    if (e.axis === null || Number.isNaN(e.axis) || e.axis < 0 || e.axis > 180 || !Number.isInteger(e.axis)) errors.push(name + ': axis не прочитан или вне 0-180');\n  } else if (e.axis !== null && !Number.isNaN(e.axis) && (e.axis < 0 || e.axis > 180 || !Number.isInteger(e.axis))) errors.push(name + ': axis вне 0-180');\n  return e;\n}\nconst od = eye('OD', r.od), os = eye('OS', r.os);\nlet add = num(r.add), pd = num(r.pd);\nif (add !== null && (Number.isNaN(add) || add < 0 || add > 4 || !step(add))) { errors.push('add вне диапазона или не кратен 0,25'); add = null; }\nif (pd !== null && (Number.isNaN(pd) || pd < 40 || pd > 80)) { errors.push('pd вне диапазона 40-80'); pd = null; }\nif (pd === null && !errors.some((x) => x.startsWith('pd'))) errors.push('pd не прочитан');\nreturn { json: { ok: errors.length === 0, errors, rx: { od, os, add, pd }, card: src.card, chat: src.chat, message_id: src.message_id } };\n"
+      },
+      "name": "Проверить значения",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        -120
+      ],
+      "id": "3d4ad02b-7784-5b33-b0b7-72672900ef35",
+      "notes": "Ловушка 1: таблица привязывается к якорным меткам (подписи OD, OS и SPH, CYL, AXIS). Дальше диапазоны и шаг 0,25. Неясность даёт ручной ввод."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Значения прошли?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        -120
+      ],
+      "id": "719f5cfd-4751-57ca-8fad-6f4bd88e026d"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT od_sph, od_cyl, od_axis, os_sph, os_cyl, os_axis, add_pwr, pd FROM rx_checks WHERE card_no = $1 AND status = 'confirmed' ORDER BY id DESC LIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [ $json.card ] }}"
+        }
+      },
+      "name": "История клиента",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1920,
+        -240
+      ],
+      "id": "270dfe0c-a92a-5c84-8f38-df5260063738",
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Rx PostgreSQL"
+        }
+      },
+      "notes": "Последний подтверждённый врачом рецепт этой карты. Если истории нет, результат «первая запись».",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Сравнение нового бланка с последним подтверждённым рецептом клиента. Решает код, не нейросеть. Пороги условные: подберите свои вместе с врачом.\nconst LIM = { sph: 1.0, cyl: 0.75, axis: 20 };\nconst cur = $('Проверить значения').item.json;\nconst rx = cur.rx;\nconst h = $json && $json.od_sph !== undefined && $json.od_sph !== null ? $json : null;\nconst n = (v) => (v === null || v === undefined ? null : Number(v));\nconst reasons = [];\nlet verdict = 'ok';\nif (!h) {\n  verdict = 'review';\n  reasons.push('нет подтверждённой истории по этой карте: нужна проверка врача');\n} else {\n  const hist = { od: { sph: n(h.od_sph), cyl: n(h.od_cyl), axis: n(h.od_axis) }, os: { sph: n(h.os_sph), cyl: n(h.os_cyl), axis: n(h.os_axis) } };\n  for (const [name, side] of [['OD', 'od'], ['OS', 'os']]) {\n    const a = hist[side], b = rx[side];\n    if (a.cyl !== null && b.cyl !== null && a.cyl !== 0 && b.cyl !== 0 && Math.sign(a.cyl) !== Math.sign(b.cyl)) reasons.push(name + ': знак цилиндра изменился (' + a.cyl + ' → ' + b.cyl + ')');\n    if (a.sph !== null && b.sph !== null && Math.abs(a.sph - b.sph) > LIM.sph) reasons.push(name + ': скачок sph ' + Math.abs(a.sph - b.sph).toFixed(2) + ' дптр, порог ' + LIM.sph.toFixed(2));\n    if (a.cyl !== null && b.cyl !== null && Math.abs(a.cyl - b.cyl) > LIM.cyl) reasons.push(name + ': скачок cyl ' + Math.abs(a.cyl - b.cyl).toFixed(2) + ' дптр, порог ' + LIM.cyl.toFixed(2));\n    if (a.axis !== null && b.axis !== null && a.cyl && b.cyl) {\n      const d = Math.abs(a.axis - b.axis); const dd = Math.min(d, 180 - d);\n      if (dd > LIM.axis) reasons.push(name + ': ось сдвинулась на ' + dd + '°, порог ' + LIM.axis + '°');\n    }\n  }\n  if (reasons.length) verdict = 'block';\n}\nreturn { json: { ...cur, verdict, reasons, has_history: !!h } };\n"
+      },
+      "name": "Сравнить с историей",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        -240
+      ],
+      "id": "6c83e210-d51e-5b43-a958-2410ba86cf24",
+      "notes": "Решает код: смена знака цилиндра, скачок sph и cyl, сдвиг оси. Пороги в начале узла условные."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO rx_checks (card_no, od_sph, od_cyl, od_axis, os_sph, os_cyl, os_axis, add_pwr, pd, verdict, reasons) VALUES ($1, $2::numeric, $3::numeric, $4::int, $5::numeric, $6::numeric, $7::int, $8::numeric, $9::numeric, $10, $11::jsonb) RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.card, $json.rx.od.sph, $json.rx.od.cyl, $json.rx.od.axis, $json.rx.os.sph, $json.rx.os.cyl, $json.rx.os.axis, $json.rx.add, $json.rx.pd, $json.verdict, JSON.stringify($json.reasons) ] }}"
+        }
+      },
+      "name": "Записать проверку",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2400,
+        -240
+      ],
+      "id": "3125531a-0e65-519f-9c6d-3afaf3a994a0",
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Rx PostgreSQL"
+        }
+      },
+      "notes": "Ловушка 2: шаг 0,25 дополнительно проверяет сама база (CHECK в init.sql). Запись создаётся со статусом pending до решения врача.",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Карточка для врача: значения, вердикт, причины. Заказ на завод система сама не отправляет: нужна кнопка врача.\nconst j = $('Сравнить с историей').item.json;\nconst id = $json.id;\nconst f = (v) => (v === null || v === undefined ? '-' : (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v).toFixed(2).replace('.', ','));\nconst eye = (n, e) => n + ': SPH ' + f(e.sph) + '  CYL ' + f(e.cyl) + '  AXIS ' + (e.axis === null || e.axis === undefined ? '-' : e.axis);\nconst head = j.verdict === 'block' ? 'ЗАКАЗ ЗАБЛОКИРОВАН: нужно решение врача' : (j.verdict === 'review' ? 'Первая запись по карте: проверьте бланк' : 'Сходится с историей: подтвердите перед заказом');\nconst lines = ['Проверка рецепта, карта ' + j.card + ' (запись №' + id + ')', head, '', eye('OD (правый)', j.rx.od), eye('OS (левый)', j.rx.os), 'ADD ' + f(j.rx.add) + '  PD ' + (j.rx.pd === null ? '-' : j.rx.pd)];\nif (j.reasons.length) lines.push('', 'Причины:', ...j.reasons.map((x) => '- ' + x));\nlines.push('', 'Система не ставит диагноз: сверьте цифры с бумажным бланком. Подтверждение записывает рецепт в историю клиента.');\nreturn { json: { text: lines.join('\\n'), id, card: j.card, chat: j.chat, message_id: j.message_id } };\n"
+      },
+      "name": "Собрать карточку",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        -240
+      ],
+      "id": "206c279a-c937-5526-ba83-1134dd87670a"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.ADMIN_CHAT_ID }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "Подтвердить",
+                    "additionalFields": {
+                      "callback_data": "={{ 'ok:' + $json.id }}"
+                    }
+                  },
+                  {
+                    "text": "Отклонить",
+                    "additionalFields": {
+                      "callback_data": "={{ 'no:' + $json.id }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "name": "Карточка врачу",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2880,
+        -240
+      ],
+      "id": "984ca6b9-94e0-55ef-9f0a-a016f4fb74ab",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "notes": "Карточка с кнопками. Заказ на завод система сама не отправляет: после «Подтвердить» вы отправляете заказ вручную.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "deleteMessage",
+        "chatId": "={{ $('Разобрать сообщение').item.json.chat }}",
+        "messageId": "={{ $('Разобрать сообщение').item.json.message_id }}"
+      },
+      "name": "Удалить фото из чата",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3120,
+        -240
+      ],
+      "id": "b7f41a9f-6a7a-5704-8ea9-db3a9b547302",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "notes": "Фото бланка удаляется из чата мастера после обработки. Проверьте в своей версии Bot API, что бот может удалять входящие сообщения в личном чате.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Разобрать сообщение').item.json.chat }}",
+        "text": "={{ 'Бланк по карте ' + $('Разобрать сообщение').item.json.card + ' принят и отправлен врачу на проверку. Фото удалено из чата.' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Подтверждение мастеру",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3360,
+        -240
+      ],
+      "id": "a59e8187-5962-59f0-a344-8116721e6755",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat }}",
+        "text": "={{ 'Бланк по карте ' + $json.card + ' не удалось надёжно прочитать:\\n- ' + $json.errors.join('\\n- ') + '\\nВ базу ничего не записано. Перепроверьте фото (ровно, без бликов) или введите значения вручную.' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Нужен ручной ввод",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1920,
+        40
+      ],
+      "id": "51ff70aa-4447-5df4-bf86-e1cf0c053719",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.kind }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "decision"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Решение врача?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        160
+      ],
+      "id": "fc6ece2a-3d87-58a7-b0b6-b1b74abb41d8"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE rx_checks SET status = CASE WHEN $2 = 'ok' THEN 'confirmed' ELSE 'rejected' END, decided_by = $3, decided_at = now() WHERE id = $1::bigint AND status = 'pending' RETURNING id, card_no, status, verdict;",
+        "options": {
+          "queryReplacement": "={{ [ $json.rx_id, $json.decision, $json.doctor ] }}"
+        }
+      },
+      "name": "Записать решение",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        80
+      ],
+      "id": "2ee62aca-3c9c-5045-9498-42de9cb7af2e",
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Rx PostgreSQL"
+        }
+      },
+      "notes": "Решение записывается один раз: повторное нажатие ничего не меняет.",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Ответ врачу после нажатия кнопки. Если записи уже приняты другим нажатием, UPDATE ничего не вернёт.\nconst r = $json && $json.id ? $json : null;\nlet text;\nif (!r) text = 'Запись уже обработана или не найдена: ничего не изменено.';\nelse if (r.status === 'confirmed') text = 'Рецепт по карте ' + r.card_no + ' (запись №' + r.id + ') подтверждён врачом и записан в историю. Заказ на завод отправляйте вручную.';\nelse text = 'Рецепт по карте ' + r.card_no + ' (запись №' + r.id + ') отклонён: в историю не записан. Заказ на завод не отправляйте, перепроверьте бланк.';\nreturn { json: { text } };\n"
+      },
+      "name": "Текст решения",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        80
+      ],
+      "id": "47f4cd6c-7ca8-5ec2-8acd-fa74444eec2e"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.ADMIN_CHAT_ID }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Ответ врачу",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1440,
+        80
+      ],
+      "id": "44b583d8-48b9-5b35-9cf4-938c161cdba0",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.kind }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "nocard"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Нет номера карты?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        320
+      ],
+      "id": "2c28c37c-defd-5f18-8a9b-d1685a5e2c51"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat }}",
+        "text": "Добавьте в подпись к фото номер карты клиента, например: карта 1234. Имя, телефон и дату рождения писать не нужно.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Попросить номер карты",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        280
+      ],
+      "id": "4eb8a6af-ee3f-572e-9bd2-e9dc22cdfe63",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.kind }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "book"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Запись клиента?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        480
+      ],
+      "id": "2561bec8-2cd3-5d6b-9fc4-821f1626606f"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.ADMIN_CHAT_ID }}",
+        "text": "={{ 'Клиент по карте ' + $json.card + ' просит запись на проверку зрения.' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Передать администратору",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        440
+      ],
+      "id": "77addd34-a61a-5611-a031-b6bbc7905afa",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Разобрать сообщение').item.json.chat }}",
+        "text": "Передали администратору, с вами свяжутся для записи.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Ответ клиенту",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1200,
+        440
+      ],
+      "id": "07613441-8800-5893-9cc6-9585da056820",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Каждый день 10:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        760
+      ],
+      "id": "de41fa04-c442-521e-a434-0fbf0d1d29d4"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT card_no, client_chat_id FROM clients WHERE consent_recall = true AND client_chat_id IS NOT NULL AND last_visit <= current_date - interval '11 months' AND (last_recall IS NULL OR last_recall < last_visit) ORDER BY last_visit LIMIT 50;",
+        "options": {}
+      },
+      "name": "Клиенты к напоминанию",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        760
+      ],
+      "id": "2b8bedb3-bf54-50e5-8732-e2eb7bbd1270",
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Rx PostgreSQL"
+        }
+      },
+      "notes": "Автовозврат: срок 11 месяцев задан в запросе, меняйте под себя. Только клиенты с согласием, которые сами запускали бота (иначе Telegram не даст написать первым).",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ !!$json.client_chat_id }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Есть кому писать?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        760
+      ],
+      "id": "d1312d98-e86e-519c-bf87-c5e018bf3483"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.client_chat_id }}",
+        "text": "Здравствуйте! С вашей последней проверки зрения прошло около 11 месяцев. Хотите записаться на проверку?",
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "Записаться",
+                    "additionalFields": {
+                      "callback_data": "={{ 'book:' + $json.card_no }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "name": "Напомнить клиенту",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        760
+      ],
+      "id": "9c2533ae-aa90-5a88-ac87-425dae08ecf7",
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram Bot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE clients SET last_recall = now() WHERE card_no = $1;",
+        "options": {
+          "queryReplacement": "={{ [ $('Есть кому писать?').item.json.card_no ] }}"
+        }
+      },
+      "name": "Отметить напоминание",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        760
+      ],
+      "id": "72921db9-c853-59b8-9aa7-55c8207ce1f0",
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Rx PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Сообщение боту": {
+      "main": [
+        [
+          {
+            "node": "Разобрать сообщение",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Разобрать сообщение": {
+      "main": [
+        [
+          {
+            "node": "Фото бланка?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Фото бланка?": {
+      "main": [
+        [
+          {
+            "node": "Скачать фото",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Решение врача?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Скачать фото": {
+      "main": [
+        [
+          {
+            "node": "Запрос к qwen2.5-vl",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запрос к qwen2.5-vl": {
+      "main": [
+        [
+          {
+            "node": "Ollama читает бланк",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama читает бланк": {
+      "main": [
+        [
+          {
+            "node": "Проверить значения",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проверить значения": {
+      "main": [
+        [
+          {
+            "node": "Значения прошли?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Значения прошли?": {
+      "main": [
+        [
+          {
+            "node": "История клиента",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Нужен ручной ввод",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "История клиента": {
+      "main": [
+        [
+          {
+            "node": "Сравнить с историей",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Сравнить с историей": {
+      "main": [
+        [
+          {
+            "node": "Записать проверку",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Записать проверку": {
+      "main": [
+        [
+          {
+            "node": "Собрать карточку",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Собрать карточку": {
+      "main": [
+        [
+          {
+            "node": "Карточка врачу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Карточка врачу": {
+      "main": [
+        [
+          {
+            "node": "Удалить фото из чата",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Удалить фото из чата": {
+      "main": [
+        [
+          {
+            "node": "Подтверждение мастеру",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Решение врача?": {
+      "main": [
+        [
+          {
+            "node": "Записать решение",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Нет номера карты?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Записать решение": {
+      "main": [
+        [
+          {
+            "node": "Текст решения",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Текст решения": {
+      "main": [
+        [
+          {
+            "node": "Ответ врачу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Нет номера карты?": {
+      "main": [
+        [
+          {
+            "node": "Попросить номер карты",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Запись клиента?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запись клиента?": {
+      "main": [
+        [
+          {
+            "node": "Передать администратору",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Передать администратору": {
+      "main": [
+        [
+          {
+            "node": "Ответ клиенту",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Каждый день 10:00": {
+      "main": [
+        [
+          {
+            "node": "Клиенты к напоминанию",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Клиенты к напоминанию": {
+      "main": [
+        [
+          {
+            "node": "Есть кому писать?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Есть кому писать?": {
+      "main": [
+        [
+          {
+            "node": "Напомнить клиенту",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Напомнить клиенту": {
+      "main": [
+        [
+          {
+            "node": "Отметить напоминание",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
